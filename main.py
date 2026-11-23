@@ -28,7 +28,6 @@ _channel_cache: dict = {}
 _yt_slots = threading.BoundedSemaphore(3)
 
 TARGET_VALID_VIDEOS = 5
-MIN_VALID_VIDEOS = 3
 HOOK_SECONDS = 10
 CTA_SECONDS = 15
 SAMPLE_CHARS = 900
@@ -136,7 +135,6 @@ def extract_video_id(item: dict) -> Optional[str]:
 
 
 def get_transcript_via_api(video_id: str) -> Optional[List[Dict[str, Any]]]:
-    """الطريقة الأولى: youtube-transcript-api"""
     try:
         api = YouTubeTranscriptApi()
         try:
@@ -154,7 +152,6 @@ def get_transcript_via_api(video_id: str) -> Optional[List[Dict[str, Any]]]:
                     return [{"text": s.text, "start": s.start, "duration": s.duration} for s in fetched]
                 except Exception:
                     continue
-            # أي لغة
             for t in transcript_list:
                 try:
                     fetched = t.fetch()
@@ -169,7 +166,6 @@ def get_transcript_via_api(video_id: str) -> Optional[List[Dict[str, Any]]]:
 
 
 def parse_vtt(content: str) -> List[Dict[str, Any]]:
-    """تحويل ملف VTT إلى segments"""
     segments = []
     lines = content.strip().splitlines()
     i = 0
@@ -179,7 +175,7 @@ def parse_vtt(content: str) -> List[Dict[str, Any]]:
             try:
                 times = line.split("-->")
                 start_str = times[0].strip().replace(",", ".")
-                # تحويل الوقت إلى ثواني
+
                 def to_seconds(t):
                     parts = t.split(":")
                     if len(parts) == 3:
@@ -189,8 +185,8 @@ def parse_vtt(content: str) -> List[Dict[str, Any]]:
                         m, s = parts
                         return int(m) * 60 + float(s)
                     return float(t)
+
                 start = to_seconds(start_str)
-                # جمع النص
                 text_parts = []
                 i += 1
                 while i < len(lines) and lines[i].strip() and "-->" not in lines[i]:
@@ -207,7 +203,6 @@ def parse_vtt(content: str) -> List[Dict[str, Any]]:
 
 
 def get_transcript_via_ytdlp(video_id: str) -> Optional[List[Dict[str, Any]]]:
-    """الطريقة الثانية: yt-dlp (أقوى ضد الحظر)"""
     url = f"https://www.youtube.com/watch?v={video_id}"
     with tempfile.TemporaryDirectory() as tmpdir:
         try:
@@ -224,17 +219,15 @@ def get_transcript_via_ytdlp(video_id: str) -> Optional[List[Dict[str, Any]]]:
                 ],
                 capture_output=True,
                 text=True,
-                timeout=45,
+                timeout=40,
             )
         except Exception:
             return None
 
-        # نبحث عن أي ملف vtt
         vtt_files = list(Path(tmpdir).glob("*.vtt"))
         if not vtt_files:
             return None
 
-        # نفضل العربي
         chosen = None
         for f in vtt_files:
             if "ar" in f.name.lower():
@@ -252,17 +245,12 @@ def get_transcript_via_ytdlp(video_id: str) -> Optional[List[Dict[str, Any]]]:
 
 
 def get_transcript_segments(video_id: str) -> Optional[List[Dict[str, Any]]]:
-    """يجرب الـ API أولاً، ثم yt-dlp كخطة بديلة"""
-    # 1. جرب المكتبة الرسمية
     segments = get_transcript_via_api(video_id)
     if segments:
         return segments
-
-    # 2. خطة بديلة قوية
     segments = get_transcript_via_ytdlp(video_id)
     if segments:
         return segments
-
     return None
 
 
@@ -276,7 +264,6 @@ def split_spoken_parts(segments: list, duration_hint: Optional[float] = None) ->
     if duration_hint and duration_hint > total_duration:
         total_duration = duration_hint
 
-    # Hook
     hook_parts = []
     for s in segs:
         if s.get("start", 0) > HOOK_SECONDS:
@@ -286,7 +273,6 @@ def split_spoken_parts(segments: list, duration_hint: Optional[float] = None) ->
             hook_parts.append(text)
     spoken_hook = " ".join(hook_parts).strip()
 
-    # CTA
     cta_start = max(0, total_duration - CTA_SECONDS)
     cta_parts = []
     for s in segs:
@@ -296,7 +282,6 @@ def split_spoken_parts(segments: list, duration_hint: Optional[float] = None) ->
                 cta_parts.append(text)
     spoken_cta = " ".join(cta_parts).strip()
 
-    # Sample
     mid_start = total_duration * 0.2
     mid_end = total_duration * 0.8
     sample_parts = []
@@ -324,31 +309,38 @@ def split_spoken_parts(segments: list, duration_hint: Optional[float] = None) ->
     }
 
 
-def process_video(item: dict) -> Optional[dict]:
+def process_video(item: dict) -> dict:
+    """الآن يرجع الفيديو دائماً، حتى لو ما فيه ترانسكريبت"""
     video_id = extract_video_id(item)
-    if not video_id:
-        return None
 
-    segments = get_transcript_segments(video_id)
-    if not segments:
-        return None
+    spoken_hook = ""
+    spoken_cta = ""
+    transcript_sample = ""
+    has_transcript = False
 
-    duration = None
-    raw = item.get("raw") or {}
-    if isinstance(raw.get("duration"), (int, float)):
-        duration = float(raw["duration"])
-    elif isinstance(item.get("duration"), (int, float)):
-        duration = float(item["duration"])
+    if video_id:
+        segments = get_transcript_segments(video_id)
+        if segments:
+            duration = None
+            raw = item.get("raw") or {}
+            if isinstance(raw.get("duration"), (int, float)):
+                duration = float(raw["duration"])
+            elif isinstance(item.get("duration"), (int, float)):
+                duration = float(item["duration"])
 
-    spoken = split_spoken_parts(segments, duration)
+            spoken = split_spoken_parts(segments, duration)
+            spoken_hook = spoken["spoken_hook"]
+            spoken_cta = spoken["spoken_cta"]
+            transcript_sample = spoken["transcript_sample"]
+            has_transcript = True
 
     return {
         **item,
-        "video_id": video_id,
-        "spoken_hook": spoken["spoken_hook"],
-        "spoken_cta": spoken["spoken_cta"],
-        "transcript_sample": spoken["transcript_sample"],
-        "has_transcript": True,
+        "video_id": video_id or "",
+        "spoken_hook": spoken_hook,
+        "spoken_cta": spoken_cta,
+        "transcript_sample": transcript_sample,
+        "has_transcript": has_transcript,
     }
 
 
@@ -384,22 +376,20 @@ def search(data: SearchRequest):
         with ThreadPoolExecutor(max_workers=3) as pool:
             raw_items = list(pool.map(enrich, raw_items))
 
-    valid_items = []
+    # نرتب حسب الـ outlier ونأخذ أول 5
     sorted_items = sorted(raw_items, key=lambda x: x.get("outlier_ratio") or 0, reverse=True)
+    limited_items = sorted_items[:TARGET_VALID_VIDEOS]
 
-    for item in sorted_items:
-        if len(valid_items) >= TARGET_VALID_VIDEOS:
-            break
-        processed = process_video(item)
-        if processed:
-            valid_items.append(processed)
+    # نعالجهم (حتى لو ما فيه ترانسكريبت)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        valid_items = list(pool.map(process_video, limited_items))
 
     body["items"] = valid_items
     body.setdefault("ok", True)
     body["meta"] = {
         **(body.get("meta") or {}),
         "total_ms": int((time.time() - t0) * 1000),
-        "valid_with_transcript": len(valid_items),
+        "valid_with_transcript": sum(1 for x in valid_items if x.get("has_transcript")),
         "requested_target": TARGET_VALID_VIDEOS,
         "raw_found": len(raw_items),
     }
@@ -414,13 +404,13 @@ def diag():
         "platforms": sorted(ALLOWED_PLATFORMS),
         "auth_enabled": bool(API_KEY),
         "transcript_api": True,
-        "fallback": "yt-dlp",
+        "mode": "relaxed-transcript",
     }
 
 
 @app.get("/")
 def home():
-    return {"status": "Agent Reach is working", "version": "2.1-ytdlp-fallback"}
+    return {"status": "Agent Reach is working", "version": "2.2-relaxed"}
 
 
 if __name__ == "__main__":
