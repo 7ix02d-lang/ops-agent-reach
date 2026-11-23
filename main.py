@@ -6,7 +6,7 @@ import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
@@ -30,8 +30,8 @@ CHANNEL_ID_RE = re.compile(r"^UC[\w-]{20,}$")
 _channel_cache: dict = {}
 _yt_slots = threading.BoundedSemaphore(3)
 
-# الإعدادات الجديدة
-TARGET_VALID_VIDEOS = 5          # نحاول نوصل لـ 5
+# الإعدادات
+TARGET_VALID_VIDEOS = 5
 MIN_VALID_VIDEOS = 3
 HOOK_SECONDS = 10
 CTA_SECONDS = 15
@@ -46,7 +46,7 @@ def require_key(authorization: str = Header(default="")):
 class SearchRequest(BaseModel):
     query: str = Field(min_length=1, max_length=200)
     platform: str = "youtube"
-    limit: int = Field(default=12, ge=1, le=20)  # نرفع الـ limit عشان نقدر نفلتر
+    limit: int = Field(default=12, ge=1, le=20)
     outliers: bool = True
 
 
@@ -97,15 +97,21 @@ def channel_views(channel_id: str):
 
 def enrich(item: dict):
     raw = item.get("raw") or {}
-    cid, vid, views = raw.get("channel_id"), raw.get("id"), raw.get("view_count")
+    cid = raw.get("channel_id")
+    vid = raw.get("id")
+    views = raw.get("view_count")
+
     if not (isinstance(cid, str) and CHANNEL_ID_RE.match(cid) and isinstance(views, (int, float))):
         return item
+
     sample = channel_views(cid)
     if not sample:
         return item
+
     others = [v for (i, v) in sample if i != vid]
     if len(others) < MIN_SAMPLE:
         return item
+
     avg = sum(others) / len(others)
     if avg > 0:
         item["channel_avg_views"] = round(avg)
@@ -115,54 +121,107 @@ def enrich(item: dict):
 
 
 def extract_video_id(item: dict) -> Optional[str]:
-    """استخراج video_id من نتائج agent-reach"""
-    # أشكال محتملة
-    vid = item.get("id") or item.get("video_id")
-    if isinstance(vid, str) and len(vid) == 11:
-        return vid
+    """استخراج video_id من نتائج البحث"""
+    # من الحقول المباشرة
+    for key in ["id", "video_id"]:
+        vid = item.get(key)
+        if isinstance(vid, str) and len(vid) == 11:
+            return vid
 
+    # من raw
     raw = item.get("raw") or {}
-    vid = raw.get("id") or raw.get("video_id")
-    if isinstance(vid, str) and len(vid) == 11:
-        return vid
+    for key in ["id", "video_id"]:
+        vid = raw.get(key)
+        if isinstance(vid, str) and len(vid) == 11:
+            return vid
 
-    url = item.get("url") or item.get("link") or raw.get("url") or ""
-    match = re.search(r"(?:v=|youtu\.be/|shorts/)([a-zA-Z0-9_-]{11})", url)
+    # من الرابط
+    url = item.get("url") or item.get("link") or raw.get("url") or raw.get("webpage_url") or ""
+    match = re.search(r"(?:v=|youtu\.be/|shorts/|/embed/)([a-zA-Z0-9_-]{11})", str(url))
     if match:
         return match.group(1)
 
     return None
 
 
-def get_transcript_segments(video_id: str) -> Optional[list]:
-    """جلب الترانسكريبت (يفضل عربي، وإلا auto)"""
+def get_transcript_segments(video_id: str) -> Optional[List[Dict[str, Any]]]:
+    """جلب الترانسكريبت بطريقة متوافقة مع الإصدارات الجديدة"""
     try:
-        # نحاول عربي أولاً ثم أي لغة متاحة
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        api = YouTubeTranscriptApi()
 
-        # أولوية: عربي يدوي → عربي auto → أي لغة
+        # الطريقة الأولى: fetch مباشرة مع أولوية للعربية
         try:
-            transcript = transcript_list.find_transcript(["ar", "ar-SA", "ar-EG"])
+            fetched = api.fetch(video_id, languages=["ar", "ar-SA", "ar-EG", "en", "en-US"])
+            return [
+                {
+                    "text": snippet.text,
+                    "start": snippet.start,
+                    "duration": snippet.duration
+                }
+                for snippet in fetched
+            ]
         except Exception:
+            pass
+
+        # الطريقة الثانية: list ثم اختيار أفضل ترانسكريبت
+        try:
+            transcript_list = api.list(video_id)
+
+            # نحاول عربي يدوي أولاً
+            try:
+                transcript = transcript_list.find_manually_created_transcript(["ar", "ar-SA", "ar-EG"])
+                fetched = transcript.fetch()
+                return [
+                    {"text": s.text, "start": s.start, "duration": s.duration}
+                    for s in fetched
+                ]
+            except Exception:
+                pass
+
+            # عربي auto
             try:
                 transcript = transcript_list.find_generated_transcript(["ar", "ar-SA", "ar-EG"])
+                fetched = transcript.fetch()
+                return [
+                    {"text": s.text, "start": s.start, "duration": s.duration}
+                    for s in fetched
+                ]
             except Exception:
-                # أي ترانسكريبت متاح
-                available = list(transcript_list)
-                if not available:
-                    return None
-                transcript = available[0]
+                pass
 
-        return transcript.fetch()
-    except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable, Exception):
+            # أي لغة متاحة (نفضل اليدوي)
+            try:
+                transcript = transcript_list.find_transcript(["en", "en-US", "en-GB"])
+                fetched = transcript.fetch()
+                return [
+                    {"text": s.text, "start": s.start, "duration": s.duration}
+                    for s in fetched
+                ]
+            except Exception:
+                pass
+
+            # آخر محاولة: أول ترانسكريبت موجود
+            for t in transcript_list:
+                try:
+                    fetched = t.fetch()
+                    return [
+                        {"text": s.text, "start": s.start, "duration": s.duration}
+                        for s in fetched
+                    ]
+                except Exception:
+                    continue
+
+        except Exception:
+            pass
+
+        return None
+
+    except Exception:
         return None
 
 
 def split_spoken_parts(segments: list, duration_hint: Optional[float] = None) -> dict:
-    """
-    segments: قائمة dict فيها start, duration, text
-    نرجع spoken_hook, spoken_cta, transcript_sample
-    """
+    """تقسيم الترانسكريبت إلى هوك + CTA + عينة"""
     if not segments:
         return {
             "spoken_hook": "",
@@ -170,7 +229,6 @@ def split_spoken_parts(segments: list, duration_hint: Optional[float] = None) ->
             "transcript_sample": "",
         }
 
-    # نحول لـ list مرتبة
     segs = sorted(segments, key=lambda x: x.get("start", 0))
 
     # حساب المدة التقريبية
@@ -179,11 +237,10 @@ def split_spoken_parts(segments: list, duration_hint: Optional[float] = None) ->
     if duration_hint and duration_hint > total_duration:
         total_duration = duration_hint
 
-    # --- Hook: 0 → 10 ثواني ---
+    # --- Hook: أول 10 ثواني ---
     hook_parts = []
     for s in segs:
-        start = s.get("start", 0)
-        if start > HOOK_SECONDS:
+        if s.get("start", 0) > HOOK_SECONDS:
             break
         text = (s.get("text") or "").strip()
         if text:
@@ -194,18 +251,18 @@ def split_spoken_parts(segments: list, duration_hint: Optional[float] = None) ->
     cta_start = max(0, total_duration - CTA_SECONDS)
     cta_parts = []
     for s in segs:
-        start = s.get("start", 0)
-        if start >= cta_start:
+        if s.get("start", 0) >= cta_start:
             text = (s.get("text") or "").strip()
             if text:
                 cta_parts.append(text)
     spoken_cta = " ".join(cta_parts).strip()
 
-    # --- Sample من الوسط (حوالي 800-1000 حرف) ---
-    mid_start = total_duration * 0.25
-    mid_end = total_duration * 0.75
+    # --- Sample من الوسط ---
+    mid_start = total_duration * 0.2
+    mid_end = total_duration * 0.8
     sample_parts = []
     current_len = 0
+
     for s in segs:
         start = s.get("start", 0)
         if start < mid_start:
@@ -220,7 +277,7 @@ def split_spoken_parts(segments: list, duration_hint: Optional[float] = None) ->
                 break
 
     transcript_sample = " ".join(sample_parts).strip()
-    if len(transcript_sample) > SAMPLE_CHARS + 100:
+    if len(transcript_sample) > SAMPLE_CHARS + 120:
         transcript_sample = transcript_sample[:SAMPLE_CHARS] + "..."
 
     return {
@@ -231,16 +288,16 @@ def split_spoken_parts(segments: list, duration_hint: Optional[float] = None) ->
 
 
 def process_video(item: dict) -> Optional[dict]:
-    """معالجة فيديو واحد: جلب الترانسكريبت + استخراج الأجزاء"""
+    """معالجة فيديو واحد"""
     video_id = extract_video_id(item)
     if not video_id:
         return None
 
     segments = get_transcript_segments(video_id)
     if not segments:
-        return None  # تخطي حسب القرار المعتمد
+        return None
 
-    # مدة تقريبية من البيانات إن وجدت
+    # مدة الفيديو إن وجدت
     duration = None
     raw = item.get("raw") or {}
     if isinstance(raw.get("duration"), (int, float)):
@@ -250,9 +307,8 @@ def process_video(item: dict) -> Optional[dict]:
 
     spoken = split_spoken_parts(segments, duration)
 
-    # نبني العنصر النهائي
     result = {
-        **item,  # نحافظ على البيانات الأصلية (title, views, outlier...)
+        **item,
         "video_id": video_id,
         "spoken_hook": spoken["spoken_hook"],
         "spoken_cta": spoken["spoken_cta"],
@@ -274,7 +330,7 @@ def search(data: SearchRequest):
 
     t0 = time.time()
 
-    # 1. بحث أولي
+    # 1. البحث الأولي
     try:
         proc = subprocess.run(
             ["agent-reach", platform, "search", query],
@@ -283,7 +339,7 @@ def search(data: SearchRequest):
     except subprocess.TimeoutExpired:
         return {"ok": False, "items": [], "error": "search_timeout"}
     except Exception as e:
-        return {"ok": False, "items": [], "error": f"search_failed: {e}"}
+        return {"ok": False, "items": [], "error": f"search_failed: {str(e)}"}
 
     body = parse_json_output(proc.stdout)
     if not isinstance(body, dict):
@@ -293,14 +349,13 @@ def search(data: SearchRequest):
     if not isinstance(raw_items, list):
         raw_items = []
 
-    # 2. outlier enrichment (كما كان)
+    # 2. Outlier enrichment
     if data.outliers and platform == "youtube" and raw_items:
         with ThreadPoolExecutor(max_workers=3) as pool:
             raw_items = list(pool.map(enrich, raw_items))
 
-    # 3. فلترة + جلب الترانسكريبت (الجديد)
+    # 3. فلترة + جلب الترانسكريبت
     valid_items = []
-    # نرتب حسب outlier_ratio تنازلياً إن وجد
     sorted_items = sorted(
         raw_items,
         key=lambda x: x.get("outlier_ratio") or 0,
@@ -314,11 +369,6 @@ def search(data: SearchRequest):
         if processed:
             valid_items.append(processed)
 
-    # لو ما وصلنا للحد الأدنى نرجع اللي لقيناه
-    if len(valid_items) < MIN_VALID_VIDEOS:
-        # ممكن نرجع تحذير، لكن نرجع النتائج الموجودة
-        pass
-
     body["items"] = valid_items
     body.setdefault("ok", True)
     body["meta"] = {
@@ -326,6 +376,7 @@ def search(data: SearchRequest):
         "total_ms": int((time.time() - t0) * 1000),
         "valid_with_transcript": len(valid_items),
         "requested_target": TARGET_VALID_VIDEOS,
+        "raw_found": len(raw_items),
     }
     return body
 
@@ -343,7 +394,7 @@ def diag():
 
 @app.get("/")
 def home():
-    return {"status": "Agent Reach is working"}
+    return {"status": "Agent Reach is working", "version": "2.0-transcript"}
 
 
 if __name__ == "__main__":
