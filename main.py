@@ -5,17 +5,14 @@ import shutil
 import subprocess
 import threading
 import time
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, List, Dict, Any
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api._errors import (
-    TranscriptsDisabled,
-    NoTranscriptFound,
-    VideoUnavailable,
-)
 
 os.environ["PATH"] = "/home/runner/workspace/.local/share/../bin:" + os.environ.get("PATH", "")
 
@@ -30,7 +27,6 @@ CHANNEL_ID_RE = re.compile(r"^UC[\w-]{20,}$")
 _channel_cache: dict = {}
 _yt_slots = threading.BoundedSemaphore(3)
 
-# الإعدادات
 TARGET_VALID_VIDEOS = 5
 MIN_VALID_VIDEOS = 3
 HOOK_SECONDS = 10
@@ -121,123 +117,166 @@ def enrich(item: dict):
 
 
 def extract_video_id(item: dict) -> Optional[str]:
-    """استخراج video_id من نتائج البحث"""
-    # من الحقول المباشرة
     for key in ["id", "video_id"]:
         vid = item.get(key)
         if isinstance(vid, str) and len(vid) == 11:
             return vid
 
-    # من raw
     raw = item.get("raw") or {}
     for key in ["id", "video_id"]:
         vid = raw.get(key)
         if isinstance(vid, str) and len(vid) == 11:
             return vid
 
-    # من الرابط
     url = item.get("url") or item.get("link") or raw.get("url") or raw.get("webpage_url") or ""
     match = re.search(r"(?:v=|youtu\.be/|shorts/|/embed/)([a-zA-Z0-9_-]{11})", str(url))
     if match:
         return match.group(1)
+    return None
+
+
+def get_transcript_via_api(video_id: str) -> Optional[List[Dict[str, Any]]]:
+    """الطريقة الأولى: youtube-transcript-api"""
+    try:
+        api = YouTubeTranscriptApi()
+        try:
+            fetched = api.fetch(video_id, languages=["ar", "ar-SA", "ar-EG", "en", "en-US"])
+            return [{"text": s.text, "start": s.start, "duration": s.duration} for s in fetched]
+        except Exception:
+            pass
+
+        try:
+            transcript_list = api.list(video_id)
+            for lang_group in [["ar", "ar-SA", "ar-EG"], ["en", "en-US"]]:
+                try:
+                    t = transcript_list.find_transcript(lang_group)
+                    fetched = t.fetch()
+                    return [{"text": s.text, "start": s.start, "duration": s.duration} for s in fetched]
+                except Exception:
+                    continue
+            # أي لغة
+            for t in transcript_list:
+                try:
+                    fetched = t.fetch()
+                    return [{"text": s.text, "start": s.start, "duration": s.duration} for s in fetched]
+                except Exception:
+                    continue
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return None
+
+
+def parse_vtt(content: str) -> List[Dict[str, Any]]:
+    """تحويل ملف VTT إلى segments"""
+    segments = []
+    lines = content.strip().splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if "-->" in line:
+            try:
+                times = line.split("-->")
+                start_str = times[0].strip().replace(",", ".")
+                # تحويل الوقت إلى ثواني
+                def to_seconds(t):
+                    parts = t.split(":")
+                    if len(parts) == 3:
+                        h, m, s = parts
+                        return int(h) * 3600 + int(m) * 60 + float(s)
+                    elif len(parts) == 2:
+                        m, s = parts
+                        return int(m) * 60 + float(s)
+                    return float(t)
+                start = to_seconds(start_str)
+                # جمع النص
+                text_parts = []
+                i += 1
+                while i < len(lines) and lines[i].strip() and "-->" not in lines[i]:
+                    text_parts.append(lines[i].strip())
+                    i += 1
+                text = " ".join(text_parts).strip()
+                if text:
+                    segments.append({"text": text, "start": start, "duration": 2.0})
+                continue
+            except Exception:
+                pass
+        i += 1
+    return segments
+
+
+def get_transcript_via_ytdlp(video_id: str) -> Optional[List[Dict[str, Any]]]:
+    """الطريقة الثانية: yt-dlp (أقوى ضد الحظر)"""
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        try:
+            proc = subprocess.run(
+                [
+                    "yt-dlp",
+                    "--skip-download",
+                    "--write-auto-subs",
+                    "--sub-langs", "ar.*,en.*",
+                    "--convert-subs", "vtt",
+                    "--output", f"{tmpdir}/%(id)s",
+                    "--quiet",
+                    url,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=45,
+            )
+        except Exception:
+            return None
+
+        # نبحث عن أي ملف vtt
+        vtt_files = list(Path(tmpdir).glob("*.vtt"))
+        if not vtt_files:
+            return None
+
+        # نفضل العربي
+        chosen = None
+        for f in vtt_files:
+            if "ar" in f.name.lower():
+                chosen = f
+                break
+        if not chosen:
+            chosen = vtt_files[0]
+
+        try:
+            content = chosen.read_text(encoding="utf-8", errors="ignore")
+            segments = parse_vtt(content)
+            return segments if segments else None
+        except Exception:
+            return None
+
+
+def get_transcript_segments(video_id: str) -> Optional[List[Dict[str, Any]]]:
+    """يجرب الـ API أولاً، ثم yt-dlp كخطة بديلة"""
+    # 1. جرب المكتبة الرسمية
+    segments = get_transcript_via_api(video_id)
+    if segments:
+        return segments
+
+    # 2. خطة بديلة قوية
+    segments = get_transcript_via_ytdlp(video_id)
+    if segments:
+        return segments
 
     return None
 
 
-def get_transcript_segments(video_id: str) -> Optional[List[Dict[str, Any]]]:
-    """جلب الترانسكريبت بطريقة متوافقة مع الإصدارات الجديدة"""
-    try:
-        api = YouTubeTranscriptApi()
-
-        # الطريقة الأولى: fetch مباشرة مع أولوية للعربية
-        try:
-            fetched = api.fetch(video_id, languages=["ar", "ar-SA", "ar-EG", "en", "en-US"])
-            return [
-                {
-                    "text": snippet.text,
-                    "start": snippet.start,
-                    "duration": snippet.duration
-                }
-                for snippet in fetched
-            ]
-        except Exception:
-            pass
-
-        # الطريقة الثانية: list ثم اختيار أفضل ترانسكريبت
-        try:
-            transcript_list = api.list(video_id)
-
-            # نحاول عربي يدوي أولاً
-            try:
-                transcript = transcript_list.find_manually_created_transcript(["ar", "ar-SA", "ar-EG"])
-                fetched = transcript.fetch()
-                return [
-                    {"text": s.text, "start": s.start, "duration": s.duration}
-                    for s in fetched
-                ]
-            except Exception:
-                pass
-
-            # عربي auto
-            try:
-                transcript = transcript_list.find_generated_transcript(["ar", "ar-SA", "ar-EG"])
-                fetched = transcript.fetch()
-                return [
-                    {"text": s.text, "start": s.start, "duration": s.duration}
-                    for s in fetched
-                ]
-            except Exception:
-                pass
-
-            # أي لغة متاحة (نفضل اليدوي)
-            try:
-                transcript = transcript_list.find_transcript(["en", "en-US", "en-GB"])
-                fetched = transcript.fetch()
-                return [
-                    {"text": s.text, "start": s.start, "duration": s.duration}
-                    for s in fetched
-                ]
-            except Exception:
-                pass
-
-            # آخر محاولة: أول ترانسكريبت موجود
-            for t in transcript_list:
-                try:
-                    fetched = t.fetch()
-                    return [
-                        {"text": s.text, "start": s.start, "duration": s.duration}
-                        for s in fetched
-                    ]
-                except Exception:
-                    continue
-
-        except Exception:
-            pass
-
-        return None
-
-    except Exception:
-        return None
-
-
 def split_spoken_parts(segments: list, duration_hint: Optional[float] = None) -> dict:
-    """تقسيم الترانسكريبت إلى هوك + CTA + عينة"""
     if not segments:
-        return {
-            "spoken_hook": "",
-            "spoken_cta": "",
-            "transcript_sample": "",
-        }
+        return {"spoken_hook": "", "spoken_cta": "", "transcript_sample": ""}
 
     segs = sorted(segments, key=lambda x: x.get("start", 0))
-
-    # حساب المدة التقريبية
     last = segs[-1]
-    total_duration = last.get("start", 0) + last.get("duration", 0)
+    total_duration = last.get("start", 0) + last.get("duration", 2)
     if duration_hint and duration_hint > total_duration:
         total_duration = duration_hint
 
-    # --- Hook: أول 10 ثواني ---
+    # Hook
     hook_parts = []
     for s in segs:
         if s.get("start", 0) > HOOK_SECONDS:
@@ -247,7 +286,7 @@ def split_spoken_parts(segments: list, duration_hint: Optional[float] = None) ->
             hook_parts.append(text)
     spoken_hook = " ".join(hook_parts).strip()
 
-    # --- CTA: آخر 15 ثانية ---
+    # CTA
     cta_start = max(0, total_duration - CTA_SECONDS)
     cta_parts = []
     for s in segs:
@@ -257,12 +296,11 @@ def split_spoken_parts(segments: list, duration_hint: Optional[float] = None) ->
                 cta_parts.append(text)
     spoken_cta = " ".join(cta_parts).strip()
 
-    # --- Sample من الوسط ---
+    # Sample
     mid_start = total_duration * 0.2
     mid_end = total_duration * 0.8
     sample_parts = []
     current_len = 0
-
     for s in segs:
         start = s.get("start", 0)
         if start < mid_start:
@@ -275,9 +313,8 @@ def split_spoken_parts(segments: list, duration_hint: Optional[float] = None) ->
             current_len += len(text) + 1
             if current_len >= SAMPLE_CHARS:
                 break
-
     transcript_sample = " ".join(sample_parts).strip()
-    if len(transcript_sample) > SAMPLE_CHARS + 120:
+    if len(transcript_sample) > SAMPLE_CHARS + 100:
         transcript_sample = transcript_sample[:SAMPLE_CHARS] + "..."
 
     return {
@@ -288,7 +325,6 @@ def split_spoken_parts(segments: list, duration_hint: Optional[float] = None) ->
 
 
 def process_video(item: dict) -> Optional[dict]:
-    """معالجة فيديو واحد"""
     video_id = extract_video_id(item)
     if not video_id:
         return None
@@ -297,7 +333,6 @@ def process_video(item: dict) -> Optional[dict]:
     if not segments:
         return None
 
-    # مدة الفيديو إن وجدت
     duration = None
     raw = item.get("raw") or {}
     if isinstance(raw.get("duration"), (int, float)):
@@ -307,7 +342,7 @@ def process_video(item: dict) -> Optional[dict]:
 
     spoken = split_spoken_parts(segments, duration)
 
-    result = {
+    return {
         **item,
         "video_id": video_id,
         "spoken_hook": spoken["spoken_hook"],
@@ -315,7 +350,6 @@ def process_video(item: dict) -> Optional[dict]:
         "transcript_sample": spoken["transcript_sample"],
         "has_transcript": True,
     }
-    return result
 
 
 @app.post("/search", dependencies=[Depends(require_key)])
@@ -330,7 +364,6 @@ def search(data: SearchRequest):
 
     t0 = time.time()
 
-    # 1. البحث الأولي
     try:
         proc = subprocess.run(
             ["agent-reach", platform, "search", query],
@@ -345,22 +378,14 @@ def search(data: SearchRequest):
     if not isinstance(body, dict):
         return {"ok": False, "items": [], "error": "bad_output"}
 
-    raw_items = body.get("items")
-    if not isinstance(raw_items, list):
-        raw_items = []
+    raw_items = body.get("items") if isinstance(body.get("items"), list) else []
 
-    # 2. Outlier enrichment
     if data.outliers and platform == "youtube" and raw_items:
         with ThreadPoolExecutor(max_workers=3) as pool:
             raw_items = list(pool.map(enrich, raw_items))
 
-    # 3. فلترة + جلب الترانسكريبت
     valid_items = []
-    sorted_items = sorted(
-        raw_items,
-        key=lambda x: x.get("outlier_ratio") or 0,
-        reverse=True,
-    )
+    sorted_items = sorted(raw_items, key=lambda x: x.get("outlier_ratio") or 0, reverse=True)
 
     for item in sorted_items:
         if len(valid_items) >= TARGET_VALID_VIDEOS:
@@ -389,12 +414,13 @@ def diag():
         "platforms": sorted(ALLOWED_PLATFORMS),
         "auth_enabled": bool(API_KEY),
         "transcript_api": True,
+        "fallback": "yt-dlp",
     }
 
 
 @app.get("/")
 def home():
-    return {"status": "Agent Reach is working", "version": "2.0-transcript"}
+    return {"status": "Agent Reach is working", "version": "2.1-ytdlp-fallback"}
 
 
 if __name__ == "__main__":
